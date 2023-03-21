@@ -15,6 +15,7 @@ import {
 } from "./schema-resources";
 import { IFunctionClient } from "../cloud";
 import { ISimulatorContext } from "../testing/simulator";
+import { Module } from "module";
 
 export class Function implements IFunctionClient, ISimulatorResourceInstance {
   private readonly filename: string;
@@ -41,13 +42,12 @@ export class Function implements IFunctionClient, ISimulatorResourceInstance {
   }
 
   public async invoke(payload: string): Promise<string> {
-    const userCode = fs.readFileSync(this.filename, "utf8");
+    
 
     return this.context.withTrace({
       message: `Invoke (payload=${JSON.stringify(payload)}).`,
       activity: async () => {
-        return runInSandbox(userCode, payload, {
-          resolveDir: dirname(this.filename),
+        const index = sandboxRequire(this.filename, {
           context: {
             fs,
             path,
@@ -60,15 +60,13 @@ export class Function implements IFunctionClient, ISimulatorResourceInstance {
                   "process.exit() was called with exit code " + exitCode
                 );
               },
-            },
 
-            $env: {
-              ...this.env,
-              [ENV_WING_SIM_INFLIGHT_RESOURCE_PATH]: this.context.resourcePath,
-              [ENV_WING_SIM_INFLIGHT_RESOURCE_TYPE]: FUNCTION_TYPE,
+              env: {
+                ...this.env,
+                [ENV_WING_SIM_INFLIGHT_RESOURCE_PATH]: this.context.resourcePath,
+                [ENV_WING_SIM_INFLIGHT_RESOURCE_TYPE]: FUNCTION_TYPE,
+              }
             },
-
-            __dirname: dirname(this.filename),
 
             // Make the global simulator available to user code so that they can find
             // and use other resource clients
@@ -80,27 +78,25 @@ export class Function implements IFunctionClient, ISimulatorResourceInstance {
           },
           timeout: this.timeout,
         });
+
+        return index.handler(payload);
       },
     });
   }
 }
 
 interface RunCodeOptions {
-  readonly resolveDir: string;
   readonly context: { [key: string]: any };
   readonly timeout: number;
 }
 
 /**
- * Runs user code in a sandboxed environment. The code is expected to export a `handler`
- * async function which take a payload and returns a result.
- *
- * @param code The JavaScript code
- * @param payload The payload JSON object to pass to the handler
- * @param opts
- * @returns
+ * Requires `filename` into a sandboxed context.
+
+ * @param filename the file to require
+ * @param opts the options to use when requiring the file
  */
-async function runInSandbox(code: string, payload: any, opts: RunCodeOptions) {
+function sandboxRequire(filename: string, opts: RunCodeOptions) {
   const ctx: any = {};
 
   // create a copy of all the globals from our current context.
@@ -116,31 +112,38 @@ async function runInSandbox(code: string, payload: any, opts: RunCodeOptions) {
   // we are hijacking console.log to log to the inflight $logger so do not propagate
   delete ctx.console;
 
-  return new Promise(($resolve, $reject) => {
-    const wrapper = [
-      "const exports = {};",
-      "Object.assign(process.env, $env);",
-      code,
-      // The last statement is the value that will be returned by vm.runInThisContext
-      `exports.handler(${JSON.stringify(
-        payload
-      )}).then($resolve).catch($reject);`,
-    ].join("\n");
+  // we want to intercept "require" calls and execute the code in the same context so that we can
+  // share state between modules within the same inflight VM.
+  const makeRequire = (parent: string) =>  {
 
-    // we want "require"s to resolve relative to the directory of the user's code
-    const requireResolve = (p: string) =>
-      require.resolve(p, { paths: [opts.resolveDir] });
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const inflightRequire = (p: string) => require(requireResolve(p));
-    inflightRequire.resolve = requireResolve;
+    const customResolve = (request: string) => {
+      return require.resolve(request, { paths: [dirname(parent)] });
+    };
 
-    const context = vm.createContext({
-      ...ctx,
-      require: inflightRequire,
-      $resolve,
-      $reject,
-    });
+    const customRequire = (request: string) => {
+      if (Module.isBuiltin(request)) {
+        return require(request);
+      }
 
-    vm.runInContext(wrapper, context, { timeout: opts.timeout });
-  });
+      const filename = customResolve(request);
+      const code = fs.readFileSync(filename, "utf-8");
+      
+      // wrap the module based on https://nodejs.org/api/modules.html#the-module-wrapper
+      const wrapped = `(function(exports, require, module, __filename, __dirname) {${code}});`
+
+      // execute this code in the same VM context we used for the inflight entrypoint
+      const mod = vm.runInContext(wrapped, context, { timeout: opts.timeout });
+      const exports = {};
+      mod(exports, makeRequire(filename), module, filename, dirname(filename));
+      return exports;
+    };
+
+    customRequire.resolve = customResolve;
+
+    return customRequire;
+  };
+
+  const context = vm.createContext(ctx);
+  const rootRequire = makeRequire(filename);
+  return rootRequire(filename);
 }
