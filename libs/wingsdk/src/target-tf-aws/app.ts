@@ -129,7 +129,7 @@ export class App extends CdktfApp {
       disallowedRegex: /[^a-zA-Z0-9-]/,
     };
 
-    const identifier = ResourceNames.generateName(this, VPC_NAME_OPTS) //`${this.node.addr.slice(-8)}`;
+    const identifier = ResourceNames.generateName(this, VPC_NAME_OPTS);
 
     // create the app wide VPC
     this._vpc = new Vpc(this, "VPC", {
